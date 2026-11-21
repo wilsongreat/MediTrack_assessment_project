@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+meditrack_data.json
+*.tmp
