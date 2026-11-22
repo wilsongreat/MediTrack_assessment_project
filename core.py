@@ -8,18 +8,24 @@ import re
 import secrets
 import tempfile
 from dataclasses import dataclass
+from datetime import date, datetime
 
 # ----- Settings -----
 
 FILE_VERSION = 2 
+OLDEST_FILE_VERSION = 2 
 PASSWORD_MIN_LENGTH = 10
 PASSWORD_MAX_LENGTH = 128
 EMAIL_MAX_LENGTH = 254
 HASH_ITERATIONS = 600_000  
 SALT_BYTES = 16 
+OLDEST_BIRTH_YEAR = 1900
 
 # removes spaces.and checks that the email looks like proper
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+# An optional + at the start, then 7 to 20 digits, spaces, dashes or brackets.
+PHONE_PATTERN = re.compile(r"^\+?[0-9 ()-]{7,20}$")
 
 
 # ----- Errors -----
@@ -88,6 +94,38 @@ def check_password(value):
     return password
 
 
+# Checks a date of birth typed as year-month-day, like 1990-04-23, and returns
+# it in that same form. It can't be in the future or before 1900.
+# today is only passed in by the tests. Normally it is left out and the real
+# date is used.
+def parse_date_of_birth(value, today=None):
+    if today is None:
+        today = date.today()
+    text = str(value).strip()
+    if text == "":
+        raise ValidationError("Date of birth is required.")
+    try:
+        born = datetime.strptime(text, "%Y-%m-%d").date()
+    except ValueError:
+        raise ValidationError("Date of birth must look like 1990-04-23 (year-month-day).")
+    if born > today:
+        raise ValidationError("Date of birth can't be in the future.")
+    if born.year < OLDEST_BIRTH_YEAR:
+        raise ValidationError(f"Date of birth must be in {OLDEST_BIRTH_YEAR} or later.")
+    return born.isoformat()
+
+
+# Checks an optional phone number. An empty answer is allowed and gives "".
+def parse_phone(value):
+    phone = " ".join(str(value).split())
+    if phone == "":
+        return ""
+    digits = re.sub(r"[^0-9]", "", phone)  # Keep only the digits, to count them.
+    if not PHONE_PATTERN.match(phone) or len(digits) < 7:
+        raise ValidationError("Phone must be 7 to 20 digits, spaces or dashes, like 0123 456 7890.")
+    return phone
+
+
 # Turns a password and a salt into a hash, using PBKDF2-SHA256 from Python's
 def hash_password(password, salt, iterations):
     return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
@@ -119,6 +157,16 @@ class Account:
         expected = bytes.fromhex(self.password_hash)
         actual = hash_password(password, salt, self.iterations)
         return hmac.compare_digest(actual, expected)
+    
+# A patient. Each patient belongs to the professional who added them, and
+# only that professional can see them.
+@dataclass
+class Patient:
+    id: str  
+    professional_id: str  
+    name: str
+    date_of_birth: str  
+    phone: str
 
 
 # ----- The tracker -----
@@ -132,7 +180,9 @@ class MediTrack:
     def __init__(self):
         self.professionals = {}
         self.accounts = {}
+        self.patients = {}
         self.last_professional_number = 0  
+        self.last_patient_number = 0  
 
     # Finds a professional by ID
     def get_professional(self, professional_id):
@@ -181,6 +231,53 @@ class MediTrack:
         if not account.matches(str(password)):
             raise AuthenticationError("Email or password is incorrect.")
         return self.get_professional(account.professional_id)
+    
+
+    # ----- Patients -----
+
+    # Makes the next patient ID: PAT-0001, then PAT-0002, and so on.
+    def new_patient_id(self):
+        self.last_patient_number = self.last_patient_number + 1
+        return f"PAT-{self.last_patient_number:04d}"
+    
+    # Raises ConflictError if this professional already has a patient with the
+    # same name (ignoring upper/lower case) and the same date of birth.
+    # This stops the same person being added twice by mistake.
+    def check_patient_is_new(self, professional_id, name, date_of_birth):
+        for patient in self.patients.values():
+            same_professional = patient.professional_id == professional_id
+            same_name = patient.name.lower() == name.lower()
+            same_birthday = patient.date_of_birth == date_of_birth
+            if same_professional and same_name and same_birthday:
+                raise ConflictError(
+                    f"You already have {patient.name}, born {date_of_birth} ({patient.id})."
+                )
+            
+    # Adds a patient for the signed-in professional and returns the patient.
+    # Every value is checked first, so a rejected patient never uses up an ID.
+    def add_patient(self, professional_id, name, date_of_birth, phone=""):
+        professional = self.get_professional(professional_id)
+        clean_name = clean_text(name, "Name")
+        clean_date = parse_date_of_birth(date_of_birth)
+        clean_phone = parse_phone(phone)
+        self.check_patient_is_new(professional.id, clean_name, clean_date)
+
+        patient = Patient(
+            self.new_patient_id(), professional.id, clean_name, clean_date, clean_phone
+        )
+        self.patients[patient.id] = patient
+        return patient
+    
+    # Returns a list of this professional's patients, in the order they were
+    # added. Other professionals' patients are left out.
+    def list_patients(self, professional_id):
+        professional = self.get_professional(professional_id)
+        result = []
+        for patient in self.patients.values():
+            if patient.professional_id == professional.id:
+                result.append(patient)
+        return result
+
 
     # ----- Saving and loading -----
 
@@ -192,7 +289,15 @@ class MediTrack:
         accounts = []
         for account in self.accounts.values():
             accounts.append(vars(account))
-        data = {"version": FILE_VERSION, "professionals": professionals, "accounts": accounts}
+        patients = []
+        for patient in self.patients.values():
+            patients.append(vars(patient))
+        data = {
+            "version": FILE_VERSION,
+            "professionals": professionals,
+            "accounts": accounts,
+            "patients": patients,
+        }
 
         folder = os.path.dirname(os.path.abspath(path))
         temp_path = None
@@ -223,13 +328,17 @@ class MediTrack:
     # Builds a tracker from the data read out of the JSON file.
     @classmethod
     def from_data(cls, data):
-        if data["version"] != FILE_VERSION:
-            raise ValidationError(f"unsupported file version {data['version']}")
+        version = data["version"]
+        if version < OLDEST_FILE_VERSION or version > FILE_VERSION:
+            raise ValidationError(f"unsupported file version {version}")
         tracker = cls()
         for item in data["professionals"]:
             tracker.load_professional(item)
         for item in data["accounts"]:
             tracker.load_account(item)
+        if version >= 3:
+            for item in data["patients"]:
+                tracker.load_patient(item)
         return tracker
 
     # Checks one professional from the file and adds it.
@@ -264,3 +373,22 @@ class MediTrack:
             if account.professional_id == professional.id:
                 raise ValidationError(f"{professional.id} has more than one account")
         self.accounts[email] = Account(email, professional.id, salt, password_hash, iterations)
+
+    # Checks one patient from the file and adds it.
+    def load_patient(self, item):
+        patient_id = str(item["id"])
+        prefix, _, number = patient_id.partition("-")
+        if prefix != "PAT" or not number.isdigit():
+            raise ValidationError(f"unexpected ID '{patient_id}'")
+        if patient_id in self.patients:
+            raise ValidationError(f"duplicate ID '{patient_id}'")
+        professional = self.get_professional(item["professional_id"])
+        name = clean_text(item["name"], "Name")
+        date_of_birth = parse_date_of_birth(item["date_of_birth"])
+        phone = parse_phone(item["phone"])
+        self.check_patient_is_new(professional.id, name, date_of_birth)
+        self.patients[patient_id] = Patient(
+            patient_id, professional.id, name, date_of_birth, phone
+        )
+        if int(number) > self.last_patient_number:
+            self.last_patient_number = int(number)

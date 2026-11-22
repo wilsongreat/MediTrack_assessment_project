@@ -1,4 +1,4 @@
-"""MediTrack text-based application. Run with: python3 main.py"""
+"""MediTrack text-based application."""
 
 import getpass
 import os
@@ -6,10 +6,10 @@ import sys
 
 
 
-from core import MediTrack,MediTrackError, check_password, clean_text
+from core import MediTrack,MediTrackError, check_password, clean_text, parse_date_of_birth, parse_phone
 
 
-# The data file sits in the same folder as this file.
+## Constants
 APP_FOLDER = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.path.join(APP_FOLDER, "meditrack_data.json")
 
@@ -74,16 +74,15 @@ class TextApp:
 
         
     def start_menu(self):
-        """Shows the start menu until someone signs in or exits. Returns True if signed in, False if exited."""
-        while True:
+        while self.user is None:
+            print()
             print("Welcome. Sign up or sign in.")
-            print("1. Sign up")
-            print("2. Sign in")
-            print("3. Exit")
-        
+            print(" 1. Sign up")
+            print(" 2. Sign in")
+            print(" 0. Exit")
             choice = input("Choose an option: ").strip()
             if choice == "0":
-             return False
+                return False
             print()
             try:
                 if choice == "1":
@@ -96,21 +95,42 @@ class TextApp:
                 print("Cancelled.")
             except MediTrackError as error:
                 print(f"Could not do that: {error}")
-        return True  
+        return True
 
-    # Shows who is signed in. For now the only option is to sign out,
-    # which sets user back to None and returns to the start menu.
+    # Shows who is signed in and how many patients they have, then the menu:
     def signed_in_menu(self):
         while True:
             print()
             print(f"Signed in as {self.user.name} ({self.user.id}).")
+            print(self.patient_count_text())
+            print(" 1. Add a patient")
+            print(" 2. List my patients")
             print(" 0. Sign out")
             choice = input("Choose an option: ").strip()
             if choice == "0":
                 print(f"Signed out {self.user.name}.")
                 self.user = None
                 return
-            print("Please enter 0 to sign out.")
+            print()
+            try:
+                if choice == "1":
+                    self.add_patient()
+                elif choice == "2":
+                    self.list_patients()
+                else:
+                    print("Please enter a number from 0 to 2.")
+            except CancelledInput:
+                print("Cancelled.")
+            except MediTrackError as error:
+                print(f"Could not do that: {error}")
+
+     # Returns a line like "You have 3 patients." for the signed-in user.
+    # It says "patient" for one and "patients" for any other number.
+    def patient_count_text(self):
+        count = len(self.tracker.list_patients(self.user.id))
+        if count == 1:
+            return "You have 1 patient."
+        return f"You have {count} patients."
 
     # Prints a message about what changed, then saves all the data to the JSON file. 
     def save(self, message):
@@ -152,12 +172,45 @@ class TextApp:
     def sign_in(self):
         email = ask("Email")
         password = ask_password("Password")
-        try:
-            professional = self.tracker.sign_in(email, password)
-            self.user = professional
-            print(f"Signed in {professional.name} ({professional.id}).")
-        except MediTrackError as error:
-            print(f"Could not sign in: {error}")
+        professional = self.tracker.sign_in(email, password)
+        print(f"Welcome back, {professional.name}.")
+        self.user = professional
+
+    def add_patient(self):
+        name = ask_text("Patient name", "Name")
+
+        while True:
+            date_of_birth = ask("Date of birth (year-month-day, like 1990-04-23)")
+            try:
+                date_of_birth = parse_date_of_birth(date_of_birth)
+                break
+            except MediTrackError as error:
+                print(f"  {error}")
+
+        while True:
+            phone = ask("Phone (optional, press Enter to skip)")
+            try:
+                phone = parse_phone(phone)
+                break
+            except MediTrackError as error:
+                print(f"  {error}")
+
+        patient = self.tracker.add_patient(self.user.id, name, date_of_birth, phone)
+        self.save(f"Added patient {patient.name} ({patient.id}).")
+
+    # Prints every patient the signed-in user has added, one per line.
+    # Other professionals' patients are never shown.
+    def list_patients(self):
+        patients = self.tracker.list_patients(self.user.id)
+        if len(patients) == 0:
+            print("You have no patients yet. Choose 1 to add one.")
+            return
+        print("Your patients:")
+        for patient in patients:
+            line = f"  {patient.id}  {patient.name}, born {patient.date_of_birth}"
+            if patient.phone != "":
+                line = line + f", phone {patient.phone}"
+            print(line)
 
 
 
