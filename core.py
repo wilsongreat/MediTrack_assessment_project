@@ -20,6 +20,7 @@ EMAIL_MAX_LENGTH = 254
 HASH_ITERATIONS = 600_000  
 SALT_BYTES = 16 
 OLDEST_BIRTH_YEAR = 1900
+MAX_ALLERGIES = 20 
 
 # removes spaces.and checks that the email looks like proper
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -120,7 +121,7 @@ def parse_phone(value):
     phone = " ".join(str(value).split())
     if phone == "":
         return ""
-    digits = re.sub(r"[^0-9]", "", phone)  # Keep only the digits, to count them.
+    digits = re.sub(r"[^0-9]", "", phone)  
     if not PHONE_PATTERN.match(phone) or len(digits) < 7:
         raise ValidationError("Phone must be 7 to 20 digits, spaces or dashes, like 0123 456 7890.")
     return phone
@@ -129,6 +130,31 @@ def parse_phone(value):
 # Turns a password and a salt into a hash, using PBKDF2-SHA256 from Python's
 def hash_password(password, salt, iterations):
     return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+
+def check_allergies(values):
+    if not isinstance(values, list):
+        raise ValidationError("Allergies must be a list.")
+    if len(values) > MAX_ALLERGIES:
+        raise ValidationError(f"A patient can have at most {MAX_ALLERGIES} allergies.")
+    allergies = []
+    seen = [] 
+    for value in values:
+        allergy = clean_text(value, "Allergy")
+        if allergy.lower() in seen:
+            raise ValidationError(f"{allergy} is listed twice.")
+        seen.append(allergy.lower())
+        allergies.append(allergy)
+    return allergies
+
+def parse_allergies(text):
+    text = str(text).strip()
+    if text == "" or text.lower() == "none":
+        return []
+    pieces = []
+    for piece in text.split(","):
+        if piece.strip() != "":  # Skip empty pieces, like after a trailing comma.
+            pieces.append(piece)
+    return check_allergies(pieces)
 
 
 # ----- Records ----
@@ -167,6 +193,7 @@ class Patient:
     name: str
     date_of_birth: str  
     phone: str
+    allergies: list
 
 
 # ----- The tracker -----
@@ -241,10 +268,11 @@ class MediTrack:
         return f"PAT-{self.last_patient_number:04d}"
     
     # Raises ConflictError if this professional already has a patient with the
-    # same name (ignoring upper/lower case) and the same date of birth.
-    # This stops the same person being added twice by mistake.
-    def check_patient_is_new(self, professional_id, name, date_of_birth):
+    # same name and date of birth.
+    def check_patient_is_new(self, professional_id, name, date_of_birth, skip_id=None):
         for patient in self.patients.values():
+            if patient.id == skip_id:
+                continue
             same_professional = patient.professional_id == professional_id
             same_name = patient.name.lower() == name.lower()
             same_birthday = patient.date_of_birth == date_of_birth
@@ -255,18 +283,48 @@ class MediTrack:
             
     # Adds a patient for the signed-in professional and returns the patient.
     # Every value is checked first, so a rejected patient never uses up an ID.
-    def add_patient(self, professional_id, name, date_of_birth, phone=""):
+    def add_patient(self, professional_id, name, date_of_birth, phone="", allergies=None):
+        if allergies is None:
+            allergies = []
         professional = self.get_professional(professional_id)
         clean_name = clean_text(name, "Name")
         clean_date = parse_date_of_birth(date_of_birth)
         clean_phone = parse_phone(phone)
+        clean_allergies = check_allergies(allergies)
         self.check_patient_is_new(professional.id, clean_name, clean_date)
 
         patient = Patient(
-            self.new_patient_id(), professional.id, clean_name, clean_date, clean_phone
+            self.new_patient_id(), professional.id, clean_name, clean_date,
+            clean_phone, clean_allergies,
         )
         self.patients[patient.id] = patient
         return patient
+    
+    # Finds one of this professional's patients by ID
+    def get_patient(self, professional_id, patient_id):
+        professional = self.get_professional(professional_id)
+        key = str(patient_id).strip().upper()
+        if key not in self.patients:
+            raise NotFoundError(f"You have no patient '{patient_id}'.")
+        patient = self.patients[key]
+        if patient.professional_id != professional.id:
+            raise NotFoundError(f"You have no patient '{patient_id}'.")
+        return patient
+    
+    # Changes a patient's details and returns the patient.
+    def edit_patient(self, professional_id, patient_id, name, date_of_birth, phone, allergies):
+            patient = self.get_patient(professional_id, patient_id)
+            clean_name = clean_text(name, "Name")
+            clean_date = parse_date_of_birth(date_of_birth)
+            clean_phone = parse_phone(phone)
+            clean_allergies = check_allergies(allergies)
+            self.check_patient_is_new(patient.professional_id, clean_name, clean_date, patient.id)
+
+            patient.name = clean_name
+            patient.date_of_birth = clean_date
+            patient.phone = clean_phone
+            patient.allergies = clean_allergies
+            return patient
     
     # Returns a list of this professional's patients, in the order they were
     # added. Other professionals' patients are left out.
@@ -375,7 +433,7 @@ class MediTrack:
         self.accounts[email] = Account(email, professional.id, salt, password_hash, iterations)
 
     # Checks one patient from the file and adds it.
-    def load_patient(self, item):
+    def load_patient(self, item, version):
         patient_id = str(item["id"])
         prefix, _, number = patient_id.partition("-")
         if prefix != "PAT" or not number.isdigit():
@@ -386,9 +444,13 @@ class MediTrack:
         name = clean_text(item["name"], "Name")
         date_of_birth = parse_date_of_birth(item["date_of_birth"])
         phone = parse_phone(item["phone"])
+        if version >= 4:
+            allergies = check_allergies(item["allergies"])
+        else:
+            allergies = []
         self.check_patient_is_new(professional.id, name, date_of_birth)
         self.patients[patient_id] = Patient(
-            patient_id, professional.id, name, date_of_birth, phone
+            patient_id, professional.id, name, date_of_birth, phone, allergies
         )
         if int(number) > self.last_patient_number:
             self.last_patient_number = int(number)
