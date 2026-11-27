@@ -12,7 +12,7 @@ from datetime import date, datetime
 
 # ----- Settings -----
 
-FILE_VERSION = 2 
+FILE_VERSION = 5
 OLDEST_FILE_VERSION = 2 
 PASSWORD_MIN_LENGTH = 10
 PASSWORD_MAX_LENGTH = 128
@@ -21,12 +21,28 @@ HASH_ITERATIONS = 600_000
 SALT_BYTES = 16 
 OLDEST_BIRTH_YEAR = 1900
 MAX_ALLERGIES = 20 
+TIME_FORMAT = "%Y-%m-%d %H:%M"
+REASON_MAX_LENGTH = 200
+
+# An appointment's status is always one of these three.
+BOOKED = "booked"
+COMPLETED = "completed"
+CANCELLED = "cancelled"
+STATUSES = [BOOKED, COMPLETED, CANCELLED]
+
 
 # removes spaces.and checks that the email looks like proper
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 # An optional + at the start, then 7 to 20 digits, spaces, dashes or brackets.
 PHONE_PATTERN = re.compile(r"^\+?[0-9 ()-]{7,20}$")
+
+
+# An appointment's status is always one of these three.
+BOOKED = "booked"
+COMPLETED = "completed"
+CANCELLED = "cancelled"
+STATUSES = [BOOKED, COMPLETED, CANCELLED]
 
 
 # ----- Errors -----
@@ -131,6 +147,9 @@ def parse_phone(value):
 def hash_password(password, salt, iterations):
     return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
 
+
+
+# Checks a list of allergies and returns a tidy copy of it.
 def check_allergies(values):
     if not isinstance(values, list):
         raise ValidationError("Allergies must be a list.")
@@ -146,16 +165,42 @@ def check_allergies(values):
         allergies.append(allergy)
     return allergies
 
+
+# Turns typed text like "penicillin, peanuts" into a list of allergies.
 def parse_allergies(text):
     text = str(text).strip()
     if text == "" or text.lower() == "none":
         return []
     pieces = []
     for piece in text.split(","):
-        if piece.strip() != "":  # Skip empty pieces, like after a trailing comma.
+        if piece.strip() != "":  
             pieces.append(piece)
     return check_allergies(pieces)
 
+#Checks an appointment time typed as year-month-day hour:minute, 
+# like 2026-11-30 14:30, and returns it in that same form. It can't be in the past.
+def parse_appointment_time(value):
+    text = " ".join(str(value).split())
+    if text == "":
+        raise ValidationError("Date and time are required.")
+    try:
+        when = datetime.strptime(text, TIME_FORMAT)
+    except ValueError:
+        raise ValidationError("Date and time must look like 2026-11-30 14:30.")
+    return when.strftime(TIME_FORMAT)
+
+def to_datetime(when):
+    return datetime.strptime(when, TIME_FORMAT)
+
+# Checks the optional reason for an appointment, like "Check-up".
+def parse_reason(value):
+    reason = " ".join(str(value).split())
+    if len(reason) > REASON_MAX_LENGTH:
+        raise ValidationError(f"Reason must be {REASON_MAX_LENGTH} characters or fewer.")
+    return reason
+
+def appointment_time(appointment):
+    return appointment.when
 
 # ----- Records ----
 
@@ -196,6 +241,16 @@ class Patient:
     allergies: list
 
 
+# An appointment between a professional and one of their patients.
+@dataclass
+class Appointment:
+    id: str 
+    professional_id: str
+    patient_id: str
+    when: str 
+    reason: str
+    status: str 
+
 # ----- The tracker -----
 
 
@@ -208,6 +263,8 @@ class MediTrack:
         self.professionals = {}
         self.accounts = {}
         self.patients = {}
+        self.appointments = {}
+        self.last_appointment_number = 0
         self.last_professional_number = 0  
         self.last_patient_number = 0  
 
@@ -336,6 +393,84 @@ class MediTrack:
                 result.append(patient)
         return result
 
+    # ----- Appointments -----
+
+    # Makes the next appointment ID: APT-0001, then APT-0002, and so on.
+    def new_appointment_id(self):
+        self.last_appointment_number = self.last_appointment_number + 1
+        return f"APT-{self.last_appointment_number:04d}"
+    
+    def check_time_is_free(self, professional_id, when):
+        for appointment in self.appointments.values():
+            same_professional = appointment.professional_id == professional_id
+            same_time = appointment.when == when
+            if same_professional and same_time and appointment.status == BOOKED:
+                raise ConflictError(f"You already have {appointment.id} booked at {when}.")
+
+    def book_appointment(self, professional_id, patient_id, when, reason="", now=None):
+        if now is None:
+            now = datetime.now()
+        patient = self.get_patient(professional_id, patient_id)
+        clean_when = parse_appointment_time(when)
+        clean_reason = parse_reason(reason)
+        if to_datetime(clean_when) <= now:
+            raise ValidationError("The appointment must be in the future.")
+        self.check_time_is_free(patient.professional_id, clean_when)
+
+        appointment = Appointment(
+            self.new_appointment_id(), patient.professional_id, patient.id,
+            clean_when, clean_reason, BOOKED,
+        )
+        self.appointments[appointment.id] = appointment
+        return appointment
+    
+
+    def get_appointment(self, professional_id, appointment_id):
+        professional = self.get_professional(professional_id)
+        key = str(appointment_id).strip().upper()
+        if key not in self.appointments:
+            raise NotFoundError(f"You have no appointment '{appointment_id}'.")
+        appointment = self.appointments[key]
+        if appointment.professional_id != professional.id:
+            raise NotFoundError(f"You have no appointment '{appointment_id}'.")
+        return appointment   
+
+    def list_appointments(self, professional_id):
+        professional = self.get_professional(professional_id)
+        result = []
+        for appointment in self.appointments.values():
+            if appointment.professional_id == professional.id:
+                result.append(appointment)
+        return sorted(result, key=appointment_time)
+    
+
+    def next_appointment(self, professional_id, now=None):
+        if now is None:
+            now = datetime.now()
+        for appointment in self.list_appointments(professional_id):
+            if appointment.status == BOOKED and to_datetime(appointment.when) > now:
+                return appointment  
+        return None
+    
+
+    def cancel_appointment(self, professional_id, appointment_id):
+        appointment = self.get_appointment(professional_id, appointment_id)
+        if appointment.status != BOOKED:
+            raise ConflictError(f"{appointment.id} is {appointment.status}, so it can't be cancelled.")
+        appointment.status = CANCELLED
+        return appointment
+
+
+    def complete_appointment(self, professional_id, appointment_id, now=None):
+        if now is None:
+            now = datetime.now()
+        appointment = self.get_appointment(professional_id, appointment_id)
+        if appointment.status != BOOKED:
+            raise ConflictError(f"{appointment.id} is {appointment.status}, so it can't be completed.")
+        if to_datetime(appointment.when) > now:
+            raise ValidationError(f"{appointment.id} hasn't started yet, so it can't be completed.")
+        appointment.status = COMPLETED
+        return appointment
 
     # ----- Saving and loading -----
 
@@ -350,18 +485,21 @@ class MediTrack:
         patients = []
         for patient in self.patients.values():
             patients.append(vars(patient))
+        appointments = []
+        for appointment in self.appointments.values():
+            appointments.append(vars(appointment))
         data = {
             "version": FILE_VERSION,
             "professionals": professionals,
             "accounts": accounts,
             "patients": patients,
+            "appointments": appointments,
         }
 
         folder = os.path.dirname(os.path.abspath(path))
         temp_path = None
         try:
             os.makedirs(folder, exist_ok=True)
-            # mkstemp makes a file only its owner can read and write.
             handle, temp_path = tempfile.mkstemp(dir=folder, suffix=".tmp")
             with os.fdopen(handle, "w", encoding="utf-8") as file:
                 json.dump(data, file, indent=2)
@@ -396,7 +534,10 @@ class MediTrack:
             tracker.load_account(item)
         if version >= 3:
             for item in data["patients"]:
-                tracker.load_patient(item)
+                tracker.load_patient(item, version)
+        if version >= 5:
+            for item in data["appointments"]:
+                tracker.load_appointment(item)
         return tracker
 
     # Checks one professional from the file and adds it.
@@ -454,3 +595,25 @@ class MediTrack:
         )
         if int(number) > self.last_patient_number:
             self.last_patient_number = int(number)
+
+    # Checks one appointment from the file and adds it.
+    def load_appointment(self, item):
+        appointment_id = str(item["id"])
+        prefix, _, number = appointment_id.partition("-")
+        if prefix != "APT" or not number.isdigit():
+            raise ValidationError(f"unexpected ID '{appointment_id}'")
+        if appointment_id in self.appointments:
+            raise ValidationError(f"duplicate ID '{appointment_id}'")
+        patient = self.get_patient(item["professional_id"], item["patient_id"])
+        when = parse_appointment_time(item["when"])
+        reason = parse_reason(item["reason"])
+        status = str(item["status"])
+        if status not in STATUSES:
+            raise ValidationError(f"unknown status '{status}'")
+        if status == BOOKED:
+            self.check_time_is_free(patient.professional_id, when)
+        self.appointments[appointment_id] = Appointment(
+            appointment_id, patient.professional_id, patient.id, when, reason, status
+        )
+        if int(number) > self.last_appointment_number:
+            self.last_appointment_number = int(number)

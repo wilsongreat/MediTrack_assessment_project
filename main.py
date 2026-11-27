@@ -1,12 +1,13 @@
 """MediTrack text-based application."""
 
+import datetime
 import getpass
 import os
 import sys
+from datetime import datetime
 
 
-
-from core import MediTrack,MediTrackError, check_password, clean_text, parse_date_of_birth, parse_phone, parse_allergies
+from core import BOOKED, MediTrack,MediTrackError, check_password, clean_text, parse_appointment_time, parse_date_of_birth, parse_phone, parse_allergies, parse_reason, to_datetime
 
 
 ## Constants
@@ -126,6 +127,12 @@ def ask_allergies(current=None):
             print(f"  {error}")
 
 
+# Turns a saved time like "2026-11-30 14:30" into "Mon 30 Nov 2026 at 14:30",
+# which is easier to read on screen.
+def describe_time(when):
+    return to_datetime(when).strftime("%a %d %b %Y at %H:%M")
+
+
 # TextApp is the whole text-based app. It remembers the data (tracker),
 # where to save it (path) and who is signed in (user).
 class TextApp:
@@ -176,15 +183,24 @@ class TextApp:
                 print(f"Could not do that: {error}")
         return True
 
-    # Shows who is signed in and how many patients they have, then the menu:
+
+    # Shows who is signed in, how many patients they have and their next
+    # appointment, then the menu of patient and appointment options.
+    # Signing out sets user back to None and returns to the start menu.
+    # Any error is printed, and the menu shows again.
     def signed_in_menu(self):
         while True:
             print()
             print(f"Signed in as {self.user.name} ({self.user.id}).")
             print(self.patient_count_text())
+            print(self.next_appointment_text())
             print(" 1. Add a patient")
             print(" 2. List my patients")
             print(" 3. Edit a patient")
+            print(" 4. Book an appointment")
+            print(" 5. List my appointments")
+            print(" 6. Cancel an appointment")
+            print(" 7. Mark an appointment as completed")
             print(" 0. Sign out")
             choice = input("Choose an option: ").strip()
             if choice == "0":
@@ -199,12 +215,21 @@ class TextApp:
                     self.list_patients()
                 elif choice == "3":
                     self.edit_patient()
+                elif choice == "4":
+                    self.book_appointment()
+                elif choice == "5":
+                    self.list_appointments()
+                elif choice == "6":
+                    self.cancel_appointment()
+                elif choice == "7":
+                    self.complete_appointment()
                 else:
-                    print("Please enter a number from 0 to 3.")
+                    print("Please enter a number from 0 to 7.")
             except CancelledInput:
                 print("Cancelled.")
             except MediTrackError as error:
                 print(f"Could not do that: {error}")
+
 
      # Returns a line like "You have 3 patients." for the signed-in user.
     # It says "patient" for one and "patients" for any other number.
@@ -213,6 +238,14 @@ class TextApp:
         if count == 1:
             return "You have 1 patient."
         return f"You have {count} patients."
+    
+
+    def next_appointment_text(self):
+        appointment = self.tracker.next_appointment(self.user.id)
+        if appointment is None:
+            return "No upcoming appointments."
+        patient = self.tracker.get_patient(self.user.id, appointment.patient_id)
+        return f"Next appointment: {patient.name}, {describe_time(appointment.when)}."
 
     # Prints a message about what changed, then saves all the data to the JSON file. 
     def save(self, message):
@@ -309,6 +342,131 @@ class TextApp:
             self.user.id, patient.id, name, date_of_birth, phone, allergies
         )
         self.save(f"Saved changes to {patient.name} ({patient.id}).")
+
+
+    # ----- Appointments -----
+    # Prints one appointment on one line, like:
+    #   APT-0001  Mon 30 Nov 2026 at 14:30  Ada Obi (PAT-0001)  booked  Check-up
+    def print_appointment(self, appointment):
+        patient = self.tracker.get_patient(self.user.id, appointment.patient_id)
+        line = (
+            f"  {appointment.id}  {describe_time(appointment.when)}"
+            f"  {patient.name} ({patient.id})  {appointment.status}"
+        )
+        if appointment.reason != "":
+            line = line + f"  {appointment.reason}"
+        print(line)
+
+    # Asks for the appointment time until it is valid, in the future, and
+    # not already taken by another booked appointment.
+    def ask_free_time(self):
+        while True:
+            answer = ask("Date and time (year-month-day hour:minute, like 2026-11-30 14:30)")
+            try:
+                when = parse_appointment_time(answer)
+                if to_datetime(when) <= datetime.now():
+                    print("  The appointment must be in the future.")
+                    continue
+                self.tracker.check_time_is_free(self.user.id, when)
+                return when
+            except MediTrackError as error:
+                print(f"  {error}")
+
+    # Books a new appointment for one of the signed-in user's patients.
+    def book_appointment(self):
+        has_patients = self.list_patients()
+        if not has_patients:
+            return
+        print()
+        patient_id = ask("Which patient? Type their ID, like PAT-0001")
+        patient = self.tracker.get_patient(self.user.id, patient_id)
+        when = self.ask_free_time()
+
+        while True:
+            reason = ask("Reason (optional, press Enter to skip)")
+            try:
+                reason = parse_reason(reason)
+                break
+            except MediTrackError as error:
+                print(f"  {error}")
+
+        appointment = self.tracker.book_appointment(self.user.id, patient.id, when, reason)
+        self.save(f"Booked {appointment.id}: {patient.name}, {describe_time(appointment.when)}.")
+
+
+
+    # Lists all the signed-in user's appointments, with upcoming ones first.
+    def list_appointments(self):
+        appointments = self.tracker.list_appointments(self.user.id)
+        if len(appointments) == 0:
+            print("You have no appointments yet. Choose 4 to book one.")
+            return
+        now = datetime.now()
+        upcoming = []
+        others = []
+        for appointment in appointments:
+            if appointment.status == BOOKED and to_datetime(appointment.when) > now:
+                upcoming.append(appointment)
+            else:
+                others.append(appointment)
+
+        print("Upcoming:")
+        if len(upcoming) == 0:
+            print("  None.")
+        for appointment in upcoming:
+            self.print_appointment(appointment)
+        if len(others) > 0:
+            print("Earlier or closed:")
+            for appointment in others:
+                self.print_appointment(appointment)
+
+
+    # Cancels one of the signed-in user's booked appointments.
+    def cancel_appointment(self):
+        can_cancel = []
+        for appointment in self.tracker.list_appointments(self.user.id):
+            if appointment.status == BOOKED:
+                can_cancel.append(appointment)
+        if len(can_cancel) == 0:
+            print("You have no booked appointments to cancel.")
+            return
+        print("Booked appointments:")
+        for appointment in can_cancel:
+            self.print_appointment(appointment)
+        print()
+
+        appointment_id = ask("Which appointment? Type its ID, like APT-0001")
+        appointment = self.tracker.get_appointment(self.user.id, appointment_id)
+        patient = self.tracker.get_patient(self.user.id, appointment.patient_id)
+        sure = ask(
+            f"Cancel {appointment.id} with {patient.name}, {describe_time(appointment.when)}? "
+            "Type y to confirm"
+        )
+        if sure.lower() != "y":
+            print("Not cancelled.")
+            return
+        self.tracker.cancel_appointment(self.user.id, appointment.id)
+        self.save(f"Cancelled {appointment.id}.")
+
+    # Marks one of the signed-in user's booked appointments as completed.
+    def complete_appointment(self):
+        now = datetime.now()
+        can_complete = []
+        for appointment in self.tracker.list_appointments(self.user.id):
+            if appointment.status == BOOKED and to_datetime(appointment.when) <= now:
+                can_complete.append(appointment)
+        if len(can_complete) == 0:
+            print("No appointments are ready to complete. An appointment can be")
+            print("completed once its start time has passed.")
+            return
+        print("Ready to complete:")
+        for appointment in can_complete:
+            self.print_appointment(appointment)
+        print()
+
+        appointment_id = ask("Which appointment? Type its ID, like APT-0001")
+        appointment = self.tracker.complete_appointment(self.user.id, appointment_id)
+        self.save(f"Marked {appointment.id} as completed.")
 
 
 
